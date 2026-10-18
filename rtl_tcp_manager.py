@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Webová aplikace pro nastavení, spuštění a zastavení rtl_tcp na Raspberry Pi. Bez závislostí (pouze stdlib)."""
 import json
+import math
 import os
 import re
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -18,7 +21,7 @@ TOKEN = os.environ.get("MANAGER_TOKEN", "")  # pokud je nastaven, vyžaduje se v
 CONFIG_FILE = Path(__file__).with_name("config.json")
 RTL_SDR_IMAGE = Path(__file__).with_name("assets") / "rtl-sdr-v3.jpg"
 
-# klíč: (přepínač rtl_tcp, typ, min, max, výchozí)
+# klíč: (přepínač rtl_tcp nebo None pro volbu manageru, typ, min, max, výchozí)
 FIELDS = {
     "address": ("-a", "addr", None, None, "0.0.0.0"),
     "port": ("-p", int, 1, 65535, 1234),
@@ -28,11 +31,13 @@ FIELDS = {
     "ppm": ("-P", int, -1000, 1000, 0),
     "device": ("-d", int, 0, 16, 0),
     "buffers": ("-b", int, 1, 500, 15),
+    "proxy": (None, "bool", None, None, True),
 }
 
 lock = threading.Lock()
 metrics_lock = threading.Lock()
 proc = None
+rtl_proxy = None
 rtl_started_at = None
 host_cpu_sample = None
 host_network_sample = None
@@ -60,7 +65,11 @@ def validate(data):
     out = {}
     for key, (_, typ, lo, hi, dflt) in FIELDS.items():
         raw = data.get(key, dflt)
-        if typ == "addr":
+        if typ == "bool":
+            if not isinstance(raw, bool):
+                raise ValueError(f"Neplatná hodnota: {key}")
+            out[key] = raw
+        elif typ == "addr":
             s = str(raw).strip()
             parts = s.split(".")
             if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
@@ -167,12 +176,14 @@ def update_rtl_status(line):
             rtl_status["warning"] = line
 
 
-def reader(p):
+def reader(p, px=None):
     for line in p.stdout:
         line = line.rstrip()
         log.append(line)
         update_rtl_status(line)
     return_code = p.wait()
+    if px:
+        px.close()
     with rtl_status_lock:
         rtl_status["listening"] = False
         rtl_status["client_connected"] = False
@@ -313,24 +324,286 @@ def metric_history(host, rtl):
                 for key in values}
 
 
+RTL_TUNERS = {1: "E4000", 2: "FC0012", 3: "FC0013", 4: "FC2580", 5: "R820T", 6: "R828D"}
+# příkaz rtl_tcp -> (klíč stavu, parametr se znaménkem)
+RTL_COMMANDS = {
+    0x01: ("frequency", False), 0x02: ("sample_rate", False), 0x03: ("gain_mode", False),
+    0x04: ("gain_tenths_db", True), 0x05: ("ppm", True), 0x08: ("agc", False),
+    0x09: ("direct_sampling", False), 0x0A: ("offset_tuning", False), 0x0E: ("bias_tee", False),
+}
+IQ_SQUARES = tuple((value - 127.5) ** 2 for value in range(256))
+IQ_SAMPLE_BYTES = 4096
+IQ_SAMPLE_INTERVAL = 0.25
+
+
+def free_local_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def optional_bool(value):
+    return None if value is None else bool(value)
+
+
+class RtlProxy:
+    """Proxy mezi klienty rtl_tcp a lokálním rtl_tcp; sleduje příkazy klienta a statistiky proudu."""
+
+    def __init__(self, host, port, backend_port, initial, notify):
+        self.backend_port = backend_port
+        self.notify = notify
+        self.closed = threading.Event()
+        self.lock = threading.Lock()
+        self.busy = threading.Lock()
+        self.sockets = set()
+        self.state = {"agc": None, "direct_sampling": None, "offset_tuning": None, **initial}
+        self.client = None
+        self.header = None
+        self.commands = 0
+        self.iq_bytes = 0
+        self.rate_samples = deque(maxlen=16)
+        self.level_samples = deque(maxlen=8)
+        self.server = socket.create_server((host, port))
+        self.server.settimeout(0.5)
+
+    def start(self):
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def close(self):
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        self.server.close()
+        with self.lock:
+            sockets = list(self.sockets)
+        for sock in sockets:
+            self._shutdown(sock)
+
+    @staticmethod
+    def _shutdown(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _accept(self):
+        while not self.closed.is_set():
+            try:
+                client, address = self.server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._session, args=(client, address), daemon=True).start()
+
+    def _connect_backend(self):
+        deadline = time.monotonic() + 5
+        while not self.closed.is_set() and time.monotonic() < deadline:
+            try:
+                return socket.create_connection(("127.0.0.1", self.backend_port), timeout=1.0)
+            except OSError:
+                time.sleep(0.2)
+        return None
+
+    def _session(self, client, address):
+        label = f"{address[0]}:{address[1]}"
+        if not self.busy.acquire(blocking=False):
+            self.notify(f"[proxy] druhý klient {label} odmítnut, rtl_tcp obsluhuje jen jednoho")
+            client.close()
+            return
+        backend = None
+        connected = False
+        try:
+            backend = self._connect_backend()
+            if backend is None:
+                self.notify(f"[proxy] klient {label}: rtl_tcp není dostupný")
+                return
+            for sock in (client, backend):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(1.0)
+            with self.lock:
+                self.client = label
+                self.header = None
+                self.iq_bytes = 0
+                self.rate_samples.clear()
+                self.level_samples.clear()
+                self.sockets.update((client, backend))
+            connected = True
+            self.notify(f"[proxy] klient připojen {label}")
+            commands = threading.Thread(target=self._pump_commands, args=(client, backend), daemon=True)
+            commands.start()
+            self._pump_stream(backend, client)
+            commands.join(timeout=3)
+        finally:
+            client.close()
+            if backend:
+                backend.close()
+            with self.lock:
+                self.client = None
+                self.sockets.difference_update((client, backend))
+            self.busy.release()
+            if connected:
+                self.notify(f"[proxy] klient odpojen {label}")
+
+    def _send_all(self, sock, data):
+        view = memoryview(data)
+        while view and not self.closed.is_set():
+            try:
+                sent = sock.send(view)
+            except socket.timeout:
+                continue
+            view = view[sent:]
+
+    def _pump_commands(self, client, backend):
+        pending = b""
+        try:
+            while not self.closed.is_set():
+                try:
+                    data = client.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                self._send_all(backend, data)
+                pending += data
+                while len(pending) >= 5:
+                    command, value = struct.unpack(">BI", pending[:5])
+                    pending = pending[5:]
+                    self._apply_command(command, value)
+        except OSError:
+            pass
+        finally:
+            self._shutdown(client)
+            self._shutdown(backend)
+
+    def _apply_command(self, command, value):
+        entry = RTL_COMMANDS.get(command)
+        with self.lock:
+            self.commands += 1
+            if entry:
+                key, signed = entry
+                self.state[key] = value - 0x100000000 if signed and value >= 0x80000000 else value
+
+    def _pump_stream(self, backend, client):
+        header = b""
+        last_sample = 0.0
+        try:
+            while not self.closed.is_set():
+                try:
+                    data = backend.recv(65536)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                self._send_all(client, data)
+                iq = data
+                if len(header) < 12:
+                    taken = min(12 - len(header), len(data))
+                    header += data[:taken]
+                    iq = data[taken:]
+                    if len(header) == 12:
+                        self._parse_header(header)
+                now = time.monotonic()
+                with self.lock:
+                    self.iq_bytes += len(iq)
+                    total = self.iq_bytes
+                if now - last_sample >= IQ_SAMPLE_INTERVAL:
+                    last_sample = now
+                    measured = self._measure(iq[:IQ_SAMPLE_BYTES]) if len(iq) >= IQ_SAMPLE_BYTES else None
+                    with self.lock:
+                        self.rate_samples.append((now, total))
+                        if measured:
+                            self.level_samples.append((now, *measured))
+        except OSError:
+            pass
+        finally:
+            self._shutdown(backend)
+            self._shutdown(client)
+
+    def _parse_header(self, header):
+        magic, tuner, gains = struct.unpack(">4sII", header)
+        if magic == b"RTL0":
+            with self.lock:
+                self.header = (RTL_TUNERS.get(tuner, str(tuner)), gains)
+
+    @staticmethod
+    def _measure(sample):
+        mean_square = sum(map(IQ_SQUARES.__getitem__, sample)) / len(sample)
+        clipped = (sample.count(0) + sample.count(255)) * 100 / len(sample)
+        return mean_square, clipped
+
+    def snapshot(self, fallback_sample_rate):
+        now = time.monotonic()
+        with self.lock:
+            state = dict(self.state)
+            client, header, commands, total = self.client, self.header, self.commands, self.iq_bytes
+            rates = [item for item in self.rate_samples if now - item[0] <= 3.0]
+            levels = [item for item in self.level_samples if now - item[0] <= 1.5]
+        rate = None
+        if client and len(rates) >= 2 and now > rates[0][0]:
+            rate = (total - rates[0][1]) / (now - rates[0][0])
+        level = clipped = None
+        if levels:
+            mean_square = sum(item[1] for item in levels) / len(levels)
+            level = round(10 * math.log10(mean_square / 127.5 ** 2), 1)
+            clipped = round(sum(item[2] for item in levels) / len(levels), 2)
+        sample_rate = state.get("sample_rate") or fallback_sample_rate
+        gain_mode = {0: "agc", 1: "manual"}.get(state.get("gain_mode"))
+        tenths = state.get("gain_tenths_db")
+        return {
+            "client": client, "tuner": header[0] if header else None, "gain_count": header[1] if header else None,
+            "frequency": state.get("frequency"), "sample_rate": sample_rate, "gain_mode": gain_mode,
+            "gain_db": tenths / 10 if gain_mode == "manual" and tenths is not None else None,
+            "ppm": state.get("ppm"), "agc": optional_bool(state.get("agc")),
+            "direct_sampling": state.get("direct_sampling"), "offset_tuning": optional_bool(state.get("offset_tuning")),
+            "bias_tee": optional_bool(state.get("bias_tee")), "commands": commands, "iq_bytes": total,
+            "iq_bytes_per_second": rate, "expected_bytes_per_second": sample_rate * 2,
+            "level_dbfs": level, "clip_percent": clipped,
+        }
+
+
 def start(cfg):
-    global proc, rtl_started_at, rtl_cpu_sample
+    global proc, rtl_started_at, rtl_cpu_sample, rtl_proxy
     with lock:
         if is_running():
             raise RuntimeError("rtl_tcp již běží")
         exe = shutil.which("rtl_tcp")
         if not exe:
             raise RuntimeError("rtl_tcp nenalezen (sudo apt install rtl-sdr)")
+        values = dict(cfg)
+        px = None
+        if cfg["proxy"]:
+            backend_port = free_local_port()
+            initial = {
+                "frequency": cfg["frequency"], "sample_rate": cfg["sample_rate"],
+                "gain_mode": 0 if cfg["gain"] == 0 else 1, "gain_tenths_db": round(cfg["gain"] * 10),
+                "ppm": cfg["ppm"], "bias_tee": 0,
+            }
+            try:
+                px = RtlProxy(cfg["address"], cfg["port"], backend_port, initial, log.append)
+            except OSError as error:
+                raise RuntimeError(f"Proxy nelze spustit na {cfg['address']}:{cfg['port']}: {error.strerror or error}")
+            values["address"], values["port"] = "127.0.0.1", backend_port
         cmd = [exe]
         for key, (flag, *_rest) in FIELDS.items():
-            cmd += [flag, str(cfg[key])]
+            if flag:
+                cmd += [flag, str(values[key])]
         log.append("$ " + " ".join(cmd))
         reset_rtl_status()
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, start_new_session=True)
+        rtl_proxy = px
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, start_new_session=True)
+        except OSError as error:
+            rtl_proxy = None
+            if px:
+                px.close()
+            raise RuntimeError(f"rtl_tcp nelze spustit: {error}")
         rtl_started_at = time.monotonic()
         rtl_cpu_sample = None
-        threading.Thread(target=reader, args=(proc,), daemon=True).start()
+        if px:
+            px.start()
+        threading.Thread(target=reader, args=(proc, px), daemon=True).start()
 
 
 def stop():
@@ -338,6 +611,8 @@ def stop():
     with lock:
         if not is_running():
             return
+        if rtl_proxy:
+            rtl_proxy.close()
         log.append(f"[odesílám SIGTERM procesu rtl_tcp, pid {proc.pid}]")
         try:
             os.killpg(proc.pid, signal.SIGTERM)
@@ -363,11 +638,20 @@ def status():
     active_proc = proc if running else None
     host = host_metrics()
     rtl = rtl_metrics(active_proc)
+    config = load_config()
     with rtl_status_lock:
         radio = dict(rtl_status)
+    live = rtl_proxy.snapshot(config["sample_rate"]) if running and rtl_proxy else None
+    if live:
+        radio["listening"] = True
+        radio["client_connected"] = live["client"] is not None
+        if live["gain_mode"]:
+            radio["gain_mode"] = live["gain_mode"]
+        if live["bias_tee"] is not None:
+            radio["bias_tee"] = live["bias_tee"]
     return {"running": running, "pid": active_proc.pid if active_proc else None,
-            "config": load_config(), "log": list(log),
-            "host": host, "rtl_tcp": rtl, "radio": radio,
+            "config": config, "log": list(log),
+            "host": host, "rtl_tcp": rtl, "radio": radio, "live": live,
             "history": metric_history(host, rtl)}
 
 
@@ -427,6 +711,16 @@ button,input{font:inherit}
 .radio-meter-ruler{margin-top:2px;color:#96a59a;font-size:9px}
 .radio-meter-ruler .threshold-label{position:absolute;left:70%;transform:translateX(-50%);color:#ff8176}
 .radio-meter-ruler{position:relative;padding-right:1px}
+.radio-meter.is-level .radio-meter-zone{inset:0 0 0 90%}
+.radio-meter.is-level .radio-meter-threshold{left:90%}
+.radio-meter.is-level .threshold-label{left:90%}
+.radio-meter-value.is-clipping{color:#ff8176;text-shadow:0 0 6px #ff514755}
+.lcd-live{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:4px;padding:4px 2px 1px;border-top:1px solid #1d3320;color:#718078;font-size:9px;line-height:1.3}
+.lcd-live[hidden]{display:none}
+.lcd-live b{color:#baff91;font-weight:700;text-shadow:0 0 5px #85ff6555}
+.lcd-live .is-low b{color:#f2c968;text-shadow:0 0 5px #f2c96855}
+#f .field-check{grid-column:1/-1;display:flex;align-items:center;gap:10px}
+#f .field-check input{display:inline-block;width:18px;height:18px;margin:0;padding:0;accent-color:var(--green)}
 .theme-toggle{display:flex;align-items:center;gap:8px;min-height:36px;padding:0;border:0;background:transparent;color:var(--muted);font-size:11px;font-weight:700}
 .language-select{height:36px;padding:0 9px;border:1px solid var(--line);border-radius:4px;background:var(--surface);color:var(--ink);font-size:12px}
 .toggle-track{display:flex;align-items:center;width:34px;height:19px;padding:2px;border:1px solid var(--line);border-radius:999px;background:var(--surface);transition:background .18s,border-color .18s}
@@ -532,6 +826,7 @@ pre{height:280px;margin:0;padding:16px 18px;overflow:auto;background:#192521;col
             <div class="radio-meters" aria-label="Síťový provoz">
                 <div class="radio-meter"><div class="radio-meter-head"><span>DOWNLOAD</span><span class="radio-meter-value" id="download-value">—</span></div><div class="radio-meter-track" id="download-meter" role="meter" aria-label="Download rychlost, maximum 100 Mb/s, červená hranice 70 Mb/s" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="download-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>0</span><span class="threshold-label">70</span><span>100 Mb/s</span></div></div>
                 <div class="radio-meter"><div class="radio-meter-head"><span>UPLOAD</span><span class="radio-meter-value" id="upload-value">—</span></div><div class="radio-meter-track" id="upload-meter" role="meter" aria-label="Upload rychlost, maximum 100 Mb/s, červená hranice 70 Mb/s" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="upload-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>0</span><span class="threshold-label">70</span><span>100 Mb/s</span></div></div>
+                <div class="radio-meter is-level"><div class="radio-meter-head"><span>LEVEL</span><span class="radio-meter-value" id="level-value">—</span></div><div class="radio-meter-track" id="level-meter" role="meter" aria-label="Úroveň IQ, rozsah -60 až 0 dBFS, červená hranice -6 dBFS" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="level-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>-60</span><span class="threshold-label">-6</span><span>0</span></div></div>
             </div></div>
         <div class="lcd-indicators" aria-label="Stav RTL-SDR">
             <span class="lcd-indicator" id="status-device" title="Zařízení"><i class="lcd-indicator-light"></i><b class="lcd-indicator-label">DEV</b></span>
@@ -541,6 +836,13 @@ pre{height:280px;margin:0;padding:16px 18px;overflow:auto;background:#192521;col
             <span class="lcd-indicator" id="status-gain" title="Zisk"><i class="lcd-indicator-light"></i><b class="lcd-indicator-label">GAIN</b></span>
             <span class="lcd-indicator" id="status-bias" title="Bias-T"><i class="lcd-indicator-light"></i><b class="lcd-indicator-label">BT</b></span>
             <span class="lcd-indicator" id="status-warning" title="Varování"><i class="lcd-indicator-light"></i><b class="lcd-indicator-label">WARN</b></span>
+        </div>
+        <div class="lcd-live" id="lcd-live" aria-label="Živá telemetrie" hidden>
+            <span title="Aktuální vzorkovací frekvence">SR <b id="live-rate">—</b></span>
+            <span title="Aktuální zisk">GAIN <b id="live-gain">—</b></span>
+            <span title="Aktuální korekce ppm">PPM <b id="live-ppm">—</b></span>
+            <span id="live-stream-item" title="Skutečný datový tok proti očekávanému">STRM <b id="live-stream">—</b></span>
+            <span title="Připojený klient">CLIENT <b id="live-client">—</b></span>
         </div>
         </div>
         <div class="radio-lamps"><span class="radio-lamp" id="rx-lamp"><span class="radio-lamp-dot"></span>RX</span><span class="radio-lamp"><span class="radio-lamp-dot"></span>SDR</span></div>
@@ -603,9 +905,12 @@ const translations={
     "PLL není zamčená":"PLL is not locked","Stav PLL neznámý":"PLL status unknown","Klient připojen":"Client connected","Čeká na klienta":"Waiting for client","Server neposlouchá":"Server is not listening",
     "Automatické řízení zisku":"Automatic gain control","Manuální zisk":"Manual gain","Režim zisku neznámý":"Gain mode unknown","Bias-T zapnutý":"Bias-T enabled","Bias-T vypnutý":"Bias-T disabled","Stav Bias-T neznámý":"Bias-T status unknown",
     "Bez zachyceného varování":"No warnings detected","Direct sampling vypnutý":"Direct sampling disabled","Nastavení zařízení":"Device configuration","Server běží":"Server running","Hotovo":"Done","Token":"Token",
-    "Neplatná adresa":"Invalid address","rtl_tcp již běží":"rtl_tcp is already running","rtl_tcp nenalezen (sudo apt install rtl-sdr)":"rtl_tcp not found (sudo apt install rtl-sdr)","rtl_tcp se nepodařilo ukončit ani signálem SIGKILL":"Could not stop rtl_tcp, even with SIGKILL"
+    "Neplatná adresa":"Invalid address","rtl_tcp již běží":"rtl_tcp is already running","rtl_tcp nenalezen (sudo apt install rtl-sdr)":"rtl_tcp not found (sudo apt install rtl-sdr)","rtl_tcp se nepodařilo ukončit ani signálem SIGKILL":"Could not stop rtl_tcp, even with SIGKILL",
+    "Úroveň IQ, rozsah -60 až 0 dBFS, červená hranice -6 dBFS":"IQ level, range -60 to 0 dBFS, red threshold -6 dBFS","Živá telemetrie":"Live telemetry",
+    "Aktuální vzorkovací frekvence":"Current sample rate","Aktuální zisk":"Current gain","Aktuální korekce ppm":"Current ppm correction",
+    "Skutečný datový tok proti očekávanému":"Actual versus expected data rate","Připojený klient":"Connected client","Přebuzení ADC":"ADC clipping"
 };
-const fieldLabels={en:{address:"Address (-a)",port:"Port (-p)",frequency:"Frequency Hz (-f)",sample_rate:"Sample rate Hz (-s)",gain:"Gain dB, 0 = AGC (-g)",ppm:"PPM correction (-P)",device:"Device index (-d)",buffers:"Buffer count (-b)"},cs:{address:"Adresa (-a)",port:"Port (-p)",frequency:"Frekvence Hz (-f)",sample_rate:"Vzorkovací frekvence Hz (-s)",gain:"Zesílení dB, 0 = AGC (-g)",ppm:"Korekce ppm (-P)",device:"Index zařízení (-d)",buffers:"Počet bufferů (-b)"}};
+const fieldLabels={en:{address:"Address (-a)",port:"Port (-p)",frequency:"Frequency Hz (-f)",sample_rate:"Sample rate Hz (-s)",gain:"Gain dB, 0 = AGC (-g)",ppm:"PPM correction (-P)",device:"Device index (-d)",buffers:"Buffer count (-b)",proxy:"Live telemetry proxy"},cs:{address:"Adresa (-a)",port:"Port (-p)",frequency:"Frekvence Hz (-f)",sample_rate:"Vzorkovací frekvence Hz (-s)",gain:"Zesílení dB, 0 = AGC (-g)",ppm:"Korekce ppm (-P)",device:"Index zařízení (-d)",buffers:"Počet bufferů (-b)",proxy:"Proxy se živou telemetrií"}};
 let language=localStorage.getItem("language")||"en";
 const reverseTranslations=Object.fromEntries(Object.entries(translations).map(([source,target])=>[target,source]));
 const tr=value=>language==="en"?(translations[value]||value):(reverseTranslations[value]||value);
@@ -617,11 +922,37 @@ const themeToggle=document.querySelector("#theme-toggle");const savedTheme=local
 const configPanel=document.querySelector("#config-panel"),configToggle=document.querySelector("#config-toggle"),configSummary=document.querySelector("#config-summary"),servicePanel=document.querySelector("#service-panel"),serviceToggle=document.querySelector("#service-toggle"),serviceSummary=document.querySelector("#service-summary");let previousRunning=null;function setConfigCollapsed(collapsed){configPanel.classList.toggle("is-collapsed",collapsed);configToggle.setAttribute("aria-expanded",String(!collapsed));configToggle.textContent=tr(collapsed?"Zobrazit":"Skrýt");}function setServiceCollapsed(collapsed){servicePanel.classList.toggle("is-collapsed",collapsed);serviceToggle.setAttribute("aria-expanded",String(!collapsed));serviceToggle.textContent=tr(collapsed?"Zobrazit":"Skrýt");}configToggle.onclick=()=>setConfigCollapsed(!configPanel.classList.contains("is-collapsed"));serviceToggle.onclick=()=>setServiceCollapsed(!servicePanel.classList.contains("is-collapsed"));
 async function api(p,b){const r=await fetch(p,{method:b?"POST":"GET",headers:H,body:b?JSON.stringify(b):undefined});
 if(r.status==401){localStorage.token=prompt(tr("Token"));location.reload();}return r.json();}
-const form=()=>Object.fromEntries([...document.querySelectorAll("#f input")].map(i=>[i.name,i.value]));
+const form=()=>Object.fromEntries([...document.querySelectorAll("#f input")].map(i=>[i.name,i.type==="checkbox"?i.checked:i.value]));
 const formatBytes=n=>n==null?"—":n>=1073741824?(n/1073741824).toFixed(1)+" GiB":(n/1048576).toFixed(0)+" MiB";
 const formatRate=n=>n==null?"—":n>=1048576?(n/1048576).toFixed(1)+" MiB/s":n>=1024?(n/1024).toFixed(0)+" KiB/s":n.toFixed(0)+" B/s";
 const RADIO_METER_MAX_MBPS=100;
 function updateRadioMeter(name,bytesPerSecond){const mbps=bytesPerSecond==null?null:bytesPerSecond*8/1000000;const value=document.querySelector("#"+name+"-value"),fill=document.querySelector("#"+name+"-fill"),meter=document.querySelector("#"+name+"-meter");value.textContent=mbps==null?"—":mbps.toFixed(1)+" Mb/s";fill.style.width=(mbps==null?0:Math.min(100,Math.max(0,mbps/RADIO_METER_MAX_MBPS*100)))+"%";meter.setAttribute("aria-valuenow",mbps==null?"0":Math.min(RADIO_METER_MAX_MBPS,Math.max(0,mbps)).toFixed(1));meter.setAttribute("aria-valuetext",mbps==null?tr("Nedostupné"):mbps.toFixed(1)+" Mb/s");}
+const LEVEL_MIN_DBFS=-60;
+function updateLevelMeter(dbfs,clip){
+    const value=document.querySelector("#level-value"),fill=document.querySelector("#level-fill"),meter=document.querySelector("#level-meter");
+    value.textContent=dbfs==null?"—":dbfs.toFixed(1)+" dBFS";
+    value.classList.toggle("is-clipping",clip!=null&&clip>0.5);
+    value.title=clip==null?"":tr("Přebuzení ADC")+": "+clip.toFixed(2)+" %";
+    fill.style.width=(dbfs==null?0:Math.min(100,Math.max(0,(dbfs-LEVEL_MIN_DBFS)/(0-LEVEL_MIN_DBFS)*100)))+"%";
+    meter.setAttribute("aria-valuenow",dbfs==null?String(LEVEL_MIN_DBFS):Math.min(0,Math.max(LEVEL_MIN_DBFS,dbfs)).toFixed(1));
+    meter.setAttribute("aria-valuetext",dbfs==null?tr("Nedostupné"):dbfs.toFixed(1)+" dBFS");
+}
+function updateLive(s){
+    const live=s.live,box=document.querySelector("#lcd-live");
+    box.hidden=!live;
+    updateLevelMeter(live?live.level_dbfs:null,live?live.clip_percent:null);
+    if(!live)return;
+    const gain=live.gain_mode==="agc"?"AGC":live.gain_mode==="manual"&&live.gain_db!=null?live.gain_db.toFixed(1)+" dB":"—";
+    const stream=live.iq_bytes_per_second==null||!live.expected_bytes_per_second?null:Math.round(live.iq_bytes_per_second/live.expected_bytes_per_second*100);
+    const client=document.querySelector("#live-client");
+    document.querySelector("#live-rate").textContent=live.sample_rate?(live.sample_rate/1000000).toFixed(3)+" Msps":"—";
+    document.querySelector("#live-gain").textContent=gain;
+    document.querySelector("#live-ppm").textContent=live.ppm==null?"—":String(live.ppm);
+    document.querySelector("#live-stream").textContent=stream==null?"—":stream+"%";
+    document.querySelector("#live-stream-item").classList.toggle("is-low",stream!=null&&stream<95);
+    client.textContent=live.client?live.client.split(":")[0]:"—";
+    client.title=live.client||"";
+}
 const formatUptime=n=>{if(n==null)return"—";const d=Math.floor(n/86400),h=Math.floor(n%86400/3600),m=Math.floor(n%3600/60);return d?d+" d "+h+" h":h? h+" h "+m+" min":m+" min";};
 const HISTORY_KEYS={host_cpu:"host-cpu",host_memory:"host-memory",host_load:"host-load",rtl_cpu:"rtl-cpu",rtl_memory:"rtl-memory",rtl_uptime:"rtl-uptime",download_rate:"download-rate",upload_rate:"upload-rate"};
 function drawHistory(history){const now=Date.now()/1000;for(const [key,id] of Object.entries(HISTORY_KEYS)){const data=(history[key]||[]).filter(([,value])=>value!=null);const line=document.querySelector("#chart-"+id),dot=document.querySelector("#dot-"+id);if(!data.length){line.setAttribute("points","");dot.setAttribute("r","0");continue;}const values=data.map(([,value])=>value),low=Math.min(...values),high=Math.max(...values),padding=(high-low)*.1||Math.max(Math.abs(high)*.05,1);const points=data.map(([timestamp,value])=>{const x=Math.max(0,Math.min(120,(timestamp-(now-3600))/3600*120));const y=25-(value-low+padding)/(high-low+padding*2)*22;return x.toFixed(1)+","+y.toFixed(1);});line.setAttribute("points",points.join(" "));const [x,y]=points[points.length-1].split(",");dot.setAttribute("cx",x);dot.setAttribute("cy",y);dot.setAttribute("r","2");}}
@@ -641,14 +972,14 @@ function updateRadioIndicators(s){
     dsIndicator.classList.toggle("is-active",directSampling);
     dsIndicator.title=directSampling?"Direct sampling input "+(radio.direct_input??"?"):tr("Direct sampling vypnutý");
 }
-function updateMetrics(s){const h=s.host||{},r=s.rtl_tcp;document.querySelector("#lcd-frequency").textContent=((s.config.frequency||0)/1000000).toFixed(6);document.querySelector("#rx-lamp").classList.toggle("active",s.running);updateRadioIndicators(s);updateRadioMeter("download",h.download_bytes_per_second);updateRadioMeter("upload",h.upload_bytes_per_second);document.querySelector("#host-cpu").textContent=h.cpu_percent==null?"—":h.cpu_percent.toFixed(0)+"%";document.querySelector("#host-memory").textContent=formatBytes(h.memory_available_bytes);document.querySelector("#host-memory-detail").textContent=h.memory_total_bytes==null?tr("Hostitel"):formatBytes(h.memory_total_bytes)+" "+tr("Celkem");document.querySelector("#host-load").textContent=h.load_average==null?"—":h.load_average.toFixed(2);document.querySelector("#rtl-cpu").textContent=!r||r.cpu_percent==null?"—":r.cpu_percent.toFixed(0)+"%";document.querySelector("#rtl-cpu-detail").textContent=r?"PID "+r.pid:tr("Proces neběží");document.querySelector("#rtl-memory").textContent=r?formatBytes(r.memory_bytes):"—";document.querySelector("#rtl-uptime").textContent=r?formatUptime(r.uptime_seconds):"—";document.querySelector("#network-download").textContent=formatRate(h.download_bytes_per_second);document.querySelector("#network-upload").textContent=formatRate(h.upload_bytes_per_second);drawHistory(s.history||{});}
-function updateConfigPanel(s){if(previousRunning!==s.running){setConfigCollapsed(s.running);setServiceCollapsed(s.running);previousRunning=s.running;}const cfg=s.config;configSummary.textContent=s.running?((cfg.frequency/1000000).toFixed(3)+" MHz · "+(cfg.sample_rate/1000000).toFixed(3)+" Msps"):tr("Konfigurace zařízení");serviceSummary.textContent=s.running?"PID "+s.pid+" · "+tr("běží"):tr("Server zastaven");}
+function updateMetrics(s){const h=s.host||{},r=s.rtl_tcp;document.querySelector("#lcd-frequency").textContent=(((s.live&&s.live.frequency)||s.config.frequency||0)/1000000).toFixed(6);document.querySelector("#rx-lamp").classList.toggle("active",s.running);updateRadioIndicators(s);updateLive(s);updateRadioMeter("download",h.download_bytes_per_second);updateRadioMeter("upload",h.upload_bytes_per_second);document.querySelector("#host-cpu").textContent=h.cpu_percent==null?"—":h.cpu_percent.toFixed(0)+"%";document.querySelector("#host-memory").textContent=formatBytes(h.memory_available_bytes);document.querySelector("#host-memory-detail").textContent=h.memory_total_bytes==null?tr("Hostitel"):formatBytes(h.memory_total_bytes)+" "+tr("Celkem");document.querySelector("#host-load").textContent=h.load_average==null?"—":h.load_average.toFixed(2);document.querySelector("#rtl-cpu").textContent=!r||r.cpu_percent==null?"—":r.cpu_percent.toFixed(0)+"%";document.querySelector("#rtl-cpu-detail").textContent=r?"PID "+r.pid:tr("Proces neběží");document.querySelector("#rtl-memory").textContent=r?formatBytes(r.memory_bytes):"—";document.querySelector("#rtl-uptime").textContent=r?formatUptime(r.uptime_seconds):"—";document.querySelector("#network-download").textContent=formatRate(h.download_bytes_per_second);document.querySelector("#network-upload").textContent=formatRate(h.upload_bytes_per_second);drawHistory(s.history||{});}
+function updateConfigPanel(s){if(previousRunning!==s.running){setConfigCollapsed(s.running);setServiceCollapsed(s.running);previousRunning=s.running;}const cfg=s.config,live=s.live||{};configSummary.textContent=s.running?(((live.frequency||cfg.frequency)/1000000).toFixed(3)+" MHz · "+((live.sample_rate||cfg.sample_rate)/1000000).toFixed(3)+" Msps"):tr("Konfigurace zařízení");serviceSummary.textContent=s.running?"PID "+s.pid+" · "+tr("běží"):tr("Server zastaven");}
 let built=false;
 async function refresh(){const s=await api("/api/status");
-if(!built){f.innerHTML=Object.keys(fieldLabels.en).map(k=>`<label>${fieldLabels[language][k]}<input name="${k}" value="${s.config[k]}"></label>`).join("");built=true;}
+if(!built){f.innerHTML=Object.keys(fieldLabels.en).map(k=>k==="proxy"?`<label class="field-check">${fieldLabels[language][k]}<input type="checkbox" name="${k}"${s.config[k]?" checked":""}></label>`:`<label>${fieldLabels[language][k]}<input name="${k}" value="${s.config[k]}"></label>`).join("");built=true;}
 else for(const input of f.querySelectorAll("input"))input.parentElement.firstChild.nodeValue=fieldLabels[language][input.name];
 st.textContent=s.running?tr("Běží")+" · PID "+s.pid:tr("Zastaveno");document.querySelector("#status-pill").className="status "+(s.running?"is-running":"is-stopped");updateConfigPanel(s);updateMetrics(s);log.textContent=s.log.join("\\n");log.scrollTop=log.scrollHeight;}
-function translateError(error){if(language!=="en")return error;const invalidValue=error.match(/^Neplatná hodnota: (.+)$/);if(invalidValue)return"Invalid value: "+invalidValue[1];const range=error.match(/^(.+) mimo rozsah (.+)[.][.](.+)$/);if(range)return range[1]+" out of range "+range[2]+".."+range[3];return tr(error);}
+function translateError(error){if(language!=="en")return error;const invalidValue=error.match(/^Neplatná hodnota: (.+)$/);if(invalidValue)return"Invalid value: "+invalidValue[1];const range=error.match(/^(.+) mimo rozsah (.+)[.][.](.+)$/);if(range)return range[1]+" out of range "+range[2]+".."+range[3];const proxy=error.match(/^Proxy nelze spustit na (.+): (.+)$/);if(proxy)return"Cannot start proxy on "+proxy[1]+": "+proxy[2];const launch=error.match(/^rtl_tcp nelze spustit: (.+)$/);if(launch)return"Cannot start rtl_tcp: "+launch[1];return tr(error);}
 async function act(p,b){const r=await api(p,b);msg.textContent=r.error?translateError(r.error):tr("Hotovo");msg.className="message"+(r.error?" is-error":"");refresh();}
 save.onclick=()=>act("/api/config",form());
 start.onclick=async()=>{await act("/api/config",form());act("/api/start",{});};

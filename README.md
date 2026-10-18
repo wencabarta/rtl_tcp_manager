@@ -16,6 +16,10 @@ Environment variables: `MANAGER_HOST` (defaults to `0.0.0.0`), `MANAGER_PORT` (d
 
 Settings are saved to `config.json` next to `rtl_tcp_manager.py`.
 
+## Live Telemetry Proxy
+
+By default, the manager runs a small TCP proxy. Clients keep connecting to the configured address and port, while `rtl_tcp` listens only on `127.0.0.1` on a free local port. The proxy passes data through unchanged and displays the current frequency, sample rate, gain, PPM, bias-T, client address, stream rate versus expected rate, a relative IQ level (dBFS, uncalibrated and dependent on AGC) and ADC clipping. Only one client at a time is supported. Disable the proxy with the "Live telemetry proxy" checkbox to run plain `rtl_tcp`.
+
 ## Start Automatically on Raspberry Pi
 
 Run the application as a `systemd` service. This example assumes the files are in `/home/pi/rtl_tcp_manager` and the Linux user is `pi`. Adjust the path and username for your installation.
@@ -74,6 +78,10 @@ Otevřít `http://<ip-pi>:8080`.
 Proměnné prostředí: `MANAGER_HOST` (výchozí `0.0.0.0`), `MANAGER_PORT` (`8080`), `MANAGER_TOKEN` (volitelný token pro ochranu API; doporučeno v nedůvěryhodné síti).
 
 Nastavení se ukládá do `config.json` vedle `rtl_tcp_manager.py`.
+
+## Proxy pro živá data
+
+Správce ve výchozím stavu spouští malou TCP proxy. Klienti se dál připojují na nastavenou adresu a port, `rtl_tcp` ale naslouchá jen na `127.0.0.1` na volném lokálním portu. Proxy data předává beze změny a zobrazuje aktuální kmitočet, vzorkovací frekvenci, zesílení, PPM, bias-T, adresu klienta, rychlost proudu oproti očekávané, relativní úroveň IQ (dBFS, nekalibrovaná a závislá na AGC) a přebuzení ADC. Podporován je jen jeden klient najednou. Proxy lze vypnout zaškrtávátkem „Proxy pro živá data“, pak běží čistý `rtl_tcp`.
 
 ## Automatické spuštění po startu Raspberry Pi
 
