@@ -1,0 +1,10 @@
+{
+  "address": "0.0.0.0",
+  "port": 1234,
+  "frequency": 100000000,
+  "sample_rate": 2048000,
+  "gain": 0.0,
+  "ppm": 0,
+  "device": 0,
+  "buffers": 15
+}
