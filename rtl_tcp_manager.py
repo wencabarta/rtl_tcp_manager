@@ -680,8 +680,18 @@ button,input{font:inherit}
 .lcd-caption{display:block;margin-bottom:6px;color:#7bb557;font-size:10px;font-weight:700}
 .lcd-main{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,1fr);align-items:center;gap:18px}
 .lcd-frequency-panel{min-width:0}
-.lcd-readout{display:flex;align-items:baseline;gap:10px;min-width:0}
-.lcd-frequency{overflow:hidden;font:400 38px/1 "Courier New",monospace;font-variant-numeric:tabular-nums;text-shadow:0 0 8px #8aff5b,0 0 18px #67e84099;white-space:nowrap}
+.lcd-readout{display:flex;align-items:flex-end;gap:10px;min-width:0}
+.lcd-frequency{display:inline-flex;align-items:flex-end;gap:.13em;padding:.04em .1em .04em .12em;font-size:38px;line-height:1;white-space:nowrap;color:#a5ff6a;transform:skewX(-7deg);transform-origin:bottom left;filter:drop-shadow(0 0 4px #8aff5b) drop-shadow(0 0 10px #67e84099)}
+.seg{position:relative;display:inline-block;width:.58em;height:1em}
+.seg i{position:absolute;background:currentColor;opacity:.07;transition:opacity .1s}
+.seg i.on{opacity:1}
+.seg .h{left:.06em;width:.46em;height:.11em;clip-path:polygon(0 50%,12% 0,88% 0,100% 50%,88% 100%,12% 100%)}
+.seg .v{width:.11em;height:.41em;clip-path:polygon(50% 0,100% 8%,100% 92%,50% 100%,0 92%,0 8%)}
+.seg .sa{top:0}.seg .sg{top:.445em}.seg .sd{top:.89em}
+.seg .sf,.seg .se{left:0}.seg .sb,.seg .sc{left:.47em}
+.seg .sf,.seg .sb{top:.04em}.seg .se,.seg .sc{top:.55em}
+.seg-dot{display:inline-block;width:.11em;height:.11em;margin:0 0 .01em -.03em;border-radius:1px;background:currentColor}
+.seg-gap{display:inline-block;width:.3em}
 .lcd-unit{color:#9be56e;font-size:13px}
 .lcd-mode{display:none;padding:2px 5px;border:1px solid #527b40;border-radius:2px;color:#a5ff6a;font:700 10px/1 "Cascadia Code",Consolas,monospace;text-shadow:0 0 6px #8aff5b}
 .lcd-mode.is-active{display:inline-block}
@@ -714,6 +724,7 @@ button,input{font:inherit}
 .radio-meter.is-level .radio-meter-zone{inset:0 0 0 90%}
 .radio-meter.is-level .radio-meter-threshold{left:90%}
 .radio-meter.is-level .threshold-label{left:90%}
+.lcd-frequency-panel .radio-meter.is-level{margin-top:8px}
 .radio-meter-value.is-clipping{color:#ff8176;text-shadow:0 0 6px #ff514755}
 .lcd-live{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:4px;padding:4px 2px 1px;border-top:1px solid #1d3320;color:#718078;font-size:9px;line-height:1.3}
 .lcd-live[hidden]{display:none}
@@ -822,11 +833,10 @@ pre{height:280px;margin:0;padding:16px 18px;overflow:auto;background:#192521;col
         </div>
     </header>
     <section class="radio-display" aria-label="Frekvence a stav přijímače">
-        <div class="radio-lcd"><span class="lcd-caption">VFO A · FREKVENCE</span><div class="lcd-main"><div class="lcd-frequency-panel"><div class="lcd-readout"><strong class="lcd-frequency" id="lcd-frequency">000.000000</strong><span class="lcd-unit">MHz</span><span class="lcd-mode" id="ds-indicator" aria-label="Direct sampling mode">DS</span></div><div class="frequency-scale" aria-hidden="true"></div></div>
+        <div class="radio-lcd"><span class="lcd-caption">VFO A · FREKVENCE</span><div class="lcd-main"><div class="lcd-frequency-panel"><div class="lcd-readout"><strong class="lcd-frequency" id="lcd-frequency">000.000.000</strong><span class="lcd-unit">MHz</span><span class="lcd-mode" id="ds-indicator" aria-label="Direct sampling mode">DS</span></div><div class="radio-meter is-level"><div class="radio-meter-head"><span>LEVEL</span><span class="radio-meter-value" id="level-value">—</span></div><div class="radio-meter-track" id="level-meter" role="meter" aria-label="Úroveň IQ, rozsah -60 až 0 dBFS, červená hranice -6 dBFS" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="level-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>-60</span><span class="threshold-label">-6</span><span>0</span></div></div></div>
             <div class="radio-meters" aria-label="Síťový provoz">
                 <div class="radio-meter"><div class="radio-meter-head"><span>DOWNLOAD</span><span class="radio-meter-value" id="download-value">—</span></div><div class="radio-meter-track" id="download-meter" role="meter" aria-label="Download rychlost, maximum 100 Mb/s, červená hranice 70 Mb/s" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="download-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>0</span><span class="threshold-label">70</span><span>100 Mb/s</span></div></div>
                 <div class="radio-meter"><div class="radio-meter-head"><span>UPLOAD</span><span class="radio-meter-value" id="upload-value">—</span></div><div class="radio-meter-track" id="upload-meter" role="meter" aria-label="Upload rychlost, maximum 100 Mb/s, červená hranice 70 Mb/s" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="upload-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>0</span><span class="threshold-label">70</span><span>100 Mb/s</span></div></div>
-                <div class="radio-meter is-level"><div class="radio-meter-head"><span>LEVEL</span><span class="radio-meter-value" id="level-value">—</span></div><div class="radio-meter-track" id="level-meter" role="meter" aria-label="Úroveň IQ, rozsah -60 až 0 dBFS, červená hranice -6 dBFS" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60"><span class="radio-meter-zone"></span><span class="radio-meter-fill" id="level-fill"></span><span class="radio-meter-threshold"></span></div><div class="radio-meter-ruler"><span>-60</span><span class="threshold-label">-6</span><span>0</span></div></div>
             </div></div>
         <div class="lcd-indicators" aria-label="Stav RTL-SDR">
             <span class="lcd-indicator" id="status-device" title="Zařízení"><i class="lcd-indicator-light"></i><b class="lcd-indicator-label">DEV</b></span>
@@ -972,7 +982,13 @@ function updateRadioIndicators(s){
     dsIndicator.classList.toggle("is-active",directSampling);
     dsIndicator.title=directSampling?"Direct sampling input "+(radio.direct_input??"?"):tr("Direct sampling vypnutý");
 }
-function updateMetrics(s){const h=s.host||{},r=s.rtl_tcp;document.querySelector("#lcd-frequency").textContent=(((s.live&&s.live.frequency)||s.config.frequency||0)/1000000).toFixed(6);document.querySelector("#rx-lamp").classList.toggle("active",s.running);updateRadioIndicators(s);updateLive(s);updateRadioMeter("download",h.download_bytes_per_second);updateRadioMeter("upload",h.upload_bytes_per_second);document.querySelector("#host-cpu").textContent=h.cpu_percent==null?"—":h.cpu_percent.toFixed(0)+"%";document.querySelector("#host-memory").textContent=formatBytes(h.memory_available_bytes);document.querySelector("#host-memory-detail").textContent=h.memory_total_bytes==null?tr("Hostitel"):formatBytes(h.memory_total_bytes)+" "+tr("Celkem");document.querySelector("#host-load").textContent=h.load_average==null?"—":h.load_average.toFixed(2);document.querySelector("#rtl-cpu").textContent=!r||r.cpu_percent==null?"—":r.cpu_percent.toFixed(0)+"%";document.querySelector("#rtl-cpu-detail").textContent=r?"PID "+r.pid:tr("Proces neběží");document.querySelector("#rtl-memory").textContent=r?formatBytes(r.memory_bytes):"—";document.querySelector("#rtl-uptime").textContent=r?formatUptime(r.uptime_seconds):"—";document.querySelector("#network-download").textContent=formatRate(h.download_bytes_per_second);document.querySelector("#network-upload").textContent=formatRate(h.upload_bytes_per_second);drawHistory(s.history||{});}
+const SEG_MAP={"0":"abcdef","1":"bc","2":"abdeg","3":"abcdg","4":"bcfg","5":"acdfg","6":"acdefg","7":"abc","8":"abcdefg","9":"abcdfg","-":"g"};
+function setSegments(el,text){
+    if(el.dataset.seg===text)return;
+    el.dataset.seg=text;el.setAttribute("role","img");el.setAttribute("aria-label",text);
+    el.innerHTML=[...text].map(c=>c==="."?'<span class="seg-dot" aria-hidden="true"></span>':c===" "?'<span class="seg-gap" aria-hidden="true"></span>':'<span class="seg" aria-hidden="true">'+"abcdefg".split("").map(x=>'<i class="'+("adg".includes(x)?"h":"v")+" s"+x+((SEG_MAP[c]||"").includes(x)?" on":"")+'"></i>').join("")+"</span>").join("");
+}
+function updateMetrics(s){const h=s.host||{},r=s.rtl_tcp,frequency=(s.live&&s.live.frequency)||s.config.frequency||0;setSegments(document.querySelector("#lcd-frequency"),String(Math.round(frequency)).replace(/\\B(?=(\\d{3})+(?!\\d))/g,"."));document.querySelector("#rx-lamp").classList.toggle("active",s.running);updateRadioIndicators(s);updateLive(s);updateRadioMeter("download",h.download_bytes_per_second);updateRadioMeter("upload",h.upload_bytes_per_second);document.querySelector("#host-cpu").textContent=h.cpu_percent==null?"—":h.cpu_percent.toFixed(0)+"%";document.querySelector("#host-memory").textContent=formatBytes(h.memory_available_bytes);document.querySelector("#host-memory-detail").textContent=h.memory_total_bytes==null?tr("Hostitel"):formatBytes(h.memory_total_bytes)+" "+tr("Celkem");document.querySelector("#host-load").textContent=h.load_average==null?"—":h.load_average.toFixed(2);document.querySelector("#rtl-cpu").textContent=!r||r.cpu_percent==null?"—":r.cpu_percent.toFixed(0)+"%";document.querySelector("#rtl-cpu-detail").textContent=r?"PID "+r.pid:tr("Proces neběží");document.querySelector("#rtl-memory").textContent=r?formatBytes(r.memory_bytes):"—";document.querySelector("#rtl-uptime").textContent=r?formatUptime(r.uptime_seconds):"—";document.querySelector("#network-download").textContent=formatRate(h.download_bytes_per_second);document.querySelector("#network-upload").textContent=formatRate(h.upload_bytes_per_second);drawHistory(s.history||{});}
 function updateConfigPanel(s){if(previousRunning!==s.running){setConfigCollapsed(s.running);setServiceCollapsed(s.running);previousRunning=s.running;}const cfg=s.config,live=s.live||{};configSummary.textContent=s.running?(((live.frequency||cfg.frequency)/1000000).toFixed(3)+" MHz · "+((live.sample_rate||cfg.sample_rate)/1000000).toFixed(3)+" Msps"):tr("Konfigurace zařízení");serviceSummary.textContent=s.running?"PID "+s.pid+" · "+tr("běží"):tr("Server zastaven");}
 let built=false;
 async function refresh(){const s=await api("/api/status");
